@@ -51,7 +51,15 @@ warnings.filterwarnings('ignore')
 # ---------------------------
 # Configuration
 # ---------------------------
-DB_FILE = "trades.db"
+import os
+from pathlib import Path
+
+# Create data directory if it doesn't exist
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+# Database file path
+DB_FILE = DATA_DIR / "trades.db"
 SUPPORTED_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "SEK", "NOK"]
 
 # ---------------------------
@@ -675,94 +683,119 @@ if 'auto_trading_manager' not in st.session_state:
 # Database Functions
 # ---------------------------
 def get_db_engine():
-    """Create database engine"""
-    return create_engine(f"sqlite:///{DB_FILE}")
+    """Create database engine with proper error handling"""
+    try:
+        # Ensure the directory exists
+        DB_FILE.parent.mkdir(exist_ok=True)
+        
+        # Create engine with absolute path
+        db_url = f"sqlite:///{DB_FILE.absolute()}"
+        engine = create_engine(db_url, echo=False)
+        
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            
+        return engine
+    except Exception as e:
+        st.error(f"Database connection error: {e}")
+        st.error(f"Trying to connect to: {DB_FILE.absolute()}")
+        # Fallback to in-memory database
+        st.warning("Falling back to temporary in-memory database")
+        return create_engine("sqlite:///:memory:", echo=False)
 
 def init_db():
     """Initialize the database with users and trades tables"""
-    engine = get_db_engine()
-    with engine.connect() as conn:
-        # Create users table
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            user_type TEXT NOT NULL DEFAULT 'user'
-        )
-        """))
-        
-        # Check if trades table exists and get its structure
-        result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='trades'"))
-        table_exists = result.fetchone() is not None
-        
-        if table_exists:
-            # Check if user_id column exists in trades table
-            try:
-                result = conn.execute(text("PRAGMA table_info(trades)"))
-                columns = [row[1] for row in result.fetchall()]
-                
-                if 'user_id' not in columns:
-                    # Need to migrate: add user_id column
-                    try:
-                        conn.execute(text("ALTER TABLE trades ADD COLUMN user_id INTEGER DEFAULT 1"))
-                        conn.commit()
-                        st.info("Database migrated: Added user_id column")
-                    except Exception as e:
-                        # If ALTER fails, recreate table
-                        st.warning("Recreating trades table with proper schema...")
-                        conn.execute(text("DROP TABLE IF EXISTS trades"))
-                        conn.execute(text("""
-                        CREATE TABLE trades (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL DEFAULT 1,
-                            timestamp TEXT NOT NULL,
-                            symbol TEXT NOT NULL,
-                            side TEXT NOT NULL,
-                            price REAL NOT NULL,
-                            quantity REAL NOT NULL,
-                            status TEXT NOT NULL,
-                            strategy TEXT NOT NULL,
-                            pnl REAL DEFAULT 0.0,
-                            FOREIGN KEY (user_id) REFERENCES users (id)
-                        )
-                        """))
-                        st.info("Trades table recreated with proper schema")
-            except Exception as e:
-                st.error(f"Error checking database schema: {e}")
-        else:
-            # Create new trades table with proper schema
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Create users table
             conn.execute(text("""
-            CREATE TABLE trades (
+            CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL DEFAULT 1,
-                timestamp TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                price REAL NOT NULL,
-                quantity REAL NOT NULL,
-                status TEXT NOT NULL,
-                strategy TEXT NOT NULL,
-                pnl REAL DEFAULT 0.0,
-                FOREIGN KEY (user_id) REFERENCES users (id)
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                user_type TEXT NOT NULL DEFAULT 'user'
             )
             """))
-            st.info("Created trades table with proper schema")
-        
-        # Create default users
-        admin_password = hash_password("admin123")
-        conn.execute(text("""
-        INSERT OR IGNORE INTO users (username, password_hash, user_type)
-        VALUES ('admin', :password, 'institution')
-        """), {"password": admin_password})
-        
-        user_password = hash_password("karthi123")
-        conn.execute(text("""
-        INSERT OR IGNORE INTO users (username, password_hash, user_type)
-        VALUES ('karthi', :password, 'user')
-        """), {"password": user_password})
-        
-        conn.commit()
+            
+            # Check if trades table exists and get its structure
+            result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='trades'"))
+            table_exists = result.fetchone() is not None
+            
+            if table_exists:
+                # Check if user_id column exists in trades table
+                try:
+                    result = conn.execute(text("PRAGMA table_info(trades)"))
+                    columns = [row[1] for row in result.fetchall()]
+                
+                    if 'user_id' not in columns:
+                        # Need to migrate: add user_id column
+                        try:
+                            conn.execute(text("ALTER TABLE trades ADD COLUMN user_id INTEGER DEFAULT 1"))
+                            conn.commit()
+                            st.info("Database migrated: Added user_id column")
+                        except Exception as migrate_error:
+                            # If ALTER fails, recreate table
+                            st.warning("Recreating trades table with proper schema...")
+                            conn.execute(text("DROP TABLE IF EXISTS trades"))
+                            conn.execute(text("""
+                            CREATE TABLE trades (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                user_id INTEGER NOT NULL DEFAULT 1,
+                                timestamp TEXT NOT NULL,
+                                symbol TEXT NOT NULL,
+                                side TEXT NOT NULL,
+                                price REAL NOT NULL,
+                                quantity REAL NOT NULL,
+                                status TEXT NOT NULL,
+                                strategy TEXT NOT NULL,
+                                pnl REAL DEFAULT 0.0,
+                                FOREIGN KEY (user_id) REFERENCES users (id)
+                            )
+                            """))
+                            st.info("Trades table recreated with proper schema")
+                except Exception as schema_error:
+                    st.error(f"Error checking database schema: {schema_error}")
+            else:
+                # Create new trades table with proper schema
+                conn.execute(text("""
+                CREATE TABLE trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 1,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    pnl REAL DEFAULT 0.0,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+                """))
+                st.info("Created trades table with proper schema")
+            
+            # Create default users
+            admin_password = hash_password("admin123")
+            conn.execute(text("""
+            INSERT OR IGNORE INTO users (username, password_hash, user_type)
+            VALUES ('admin', :password, 'institution')
+            """), {"password": admin_password})
+            
+            user_password = hash_password("karthi123")
+            conn.execute(text("""
+            INSERT OR IGNORE INTO users (username, password_hash, user_type)
+            VALUES ('karthi', :password, 'user')
+            """), {"password": user_password})
+            
+            conn.commit()
+            return True
+            
+    except Exception as e:
+        st.error(f"Failed to initialize database: {e}")
+        st.error(f"Database path: {DB_FILE.absolute()}")
+        return False
 
 def hash_password(password):
     """Hash password with salt"""
@@ -1055,11 +1088,13 @@ def get_user_balance(user_id):
                         if open_pos['quantity'] == 0:
                             positions[symbol].pop(0)
             
-            # Calculate margin used by open positions
+            # Calculate margin used by open positions (Forex uses leverage)
             margin_used = 0
             for symbol, open_positions in positions.items():
                 for pos in open_positions:
-                    margin_used += pos['price'] * pos['quantity']
+                    # Use 1% margin requirement (100:1 leverage) instead of 100%
+                    position_margin = pos['price'] * pos['quantity'] * 0.01
+                    margin_used += position_margin
             
             available_balance = initial_balance + realized_pnl - margin_used
             return max(0, available_balance), realized_pnl, margin_used
@@ -1069,34 +1104,78 @@ def get_user_balance(user_id):
         return 10000, 0, 0
 
 def validate_trade(user_id, symbol, side, price, quantity):
-    """Validate if a trade can be executed"""
+    """Validate if a trade can be executed - Forex trading allows short positions"""
     
     # Get current position and balance
     net_position, buy_qty, sell_qty = get_user_position(user_id, symbol)
     available_balance, realized_pnl, margin_used = get_user_balance(user_id)
     
+    # Calculate required margin for the trade
+    required_margin = price * quantity * 0.01  # 1% margin requirement for Forex
+    
     if side == 'BUY':
-        # Check if user has enough balance
-        required_margin = price * quantity
+        # For BUY orders, check available balance for margin
         if required_margin > available_balance:
-            return False, f"Insufficient balance. Required: ${required_margin:.2f}, Available: ${available_balance:.2f}"
+            return False, f"Insufficient margin. Required: ${required_margin:.2f}, Available: ${available_balance:.2f}"
             
     elif side == 'SELL':
-        # Check if user has enough position to sell
-        if quantity > net_position:
-            return False, f"Insufficient position. Trying to sell {quantity}, but only have {net_position} units"
+        # For SELL orders in Forex, we allow short selling (creating negative positions)
+        # Check if user has enough margin for the position
+        if required_margin > available_balance:
+            return False, f"Insufficient margin for short position. Required: ${required_margin:.2f}, Available: ${available_balance:.2f}"
+        
+        # Optional: Set maximum short position limits (e.g., -100,000 units max)
+        max_short_position = -100000
+        new_position = net_position - quantity
+        if new_position < max_short_position:
+            return False, f"Maximum short position exceeded. Current: {net_position:,.0f}, After trade: {new_position:,.0f}, Limit: {max_short_position:,.0f}"
     
     return True, "Trade validated"
 
+def check_db_health():
+    """Check database connection and table structure"""
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Test basic connection
+            conn.execute(text("SELECT 1"))
+            
+            # Check tables exist
+            result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+            tables = [row[0] for row in result.fetchall()]
+            
+            if 'users' not in tables or 'trades' not in tables:
+                return False, "Missing required tables"
+                
+            # Check trades table structure
+            result = conn.execute(text("PRAGMA table_info(trades)"))
+            columns = [row[1] for row in result.fetchall()]
+            required_columns = ['user_id', 'timestamp', 'symbol', 'side', 'price', 'quantity', 'status', 'strategy']
+            
+            for col in required_columns:
+                if col not in columns:
+                    return False, f"Missing column: {col}"
+            
+            return True, "Database healthy"
+            
+    except Exception as e:
+        return False, f"Database error: {e}"
+
 def insert_trade(user_id, symbol, side, price, quantity, strategy):
-    """Insert a trade into database with validation"""
+    """Insert a trade into database with validation and error handling"""
     
-    # Validate trade first
+    # Check database health first
+    db_healthy, health_message = check_db_health()
+    if not db_healthy:
+        st.error(f"Database health check failed: {health_message}")
+        st.error(f"Database location: {DB_FILE.absolute()}")
+        return False, f"DATABASE ERROR: {health_message}"
+    
+    # Validate trade
     is_valid, message = validate_trade(user_id, symbol, side, price, quantity)
     if not is_valid:
         return False, f"REJECTED: {message}"
     
-    engine = get_db_engine()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     # Simulate realistic order processing
@@ -1109,7 +1188,9 @@ def insert_trade(user_id, symbol, side, price, quantity, strategy):
         status = random.choice(["Rejected", "Cancelled"])
     
     try:
+        engine = get_db_engine()
         with engine.connect() as conn:
+            # Insert trade with explicit error handling
             conn.execute(text("""
             INSERT INTO trades (user_id, timestamp, symbol, side, price, quantity, status, strategy)
             VALUES (:user_id, :timestamp, :symbol, :side, :price, :quantity, :status, :strategy)
@@ -1126,9 +1207,12 @@ def insert_trade(user_id, symbol, side, price, quantity, strategy):
             conn.commit()
             
             return True, status
+            
     except Exception as e:
-        st.error(f"Error inserting trade: {e}")
-        return False, "Error"
+        error_msg = f"Database insert failed: {str(e)}"
+        st.error(error_msg)
+        st.error(f"Database location: {DB_FILE.absolute()}")
+        return False, f"DATABASE_ERROR: {str(e)}"
 
 def load_trades(user_id):
     """Load trades for a specific user"""
@@ -1315,8 +1399,47 @@ def live_trading_section():
                 st.error("� AUTOMATED TRADING HALTED - Daily loss limit exceeded!")
                 st.warning("Trading switched to MANUAL mode for risk management")
                 auto_manager.is_active = False
+                
+            # Database Health Check (for troubleshooting deployment issues)
+            with st.expander("🔧 Database Diagnostics", expanded=False):
+                db_healthy, db_message = check_db_health()
+                if db_healthy:
+                    st.success(f"✅ {db_message}")
+                else:
+                    st.error(f"❌ {db_message}")
+                    st.error("⚠️ Database issues may prevent trade recording")
+                
+                # Show database details
+                st.info(f"📁 **Database Location:** `{DB_FILE.absolute()}`")
+                
+                try:
+                    if DB_FILE.exists():
+                        size_bytes = DB_FILE.stat().st_size
+                        size_mb = size_bytes / (1024 * 1024)
+                        st.success(f"📊 **Database Size:** {size_mb:.2f} MB")
+                        
+                        # Test database connection
+                        engine = get_db_engine()
+                        with engine.connect() as conn:
+                            # Count total trades
+                            result = conn.execute(text("SELECT COUNT(*) FROM trades"))
+                            total_trades = result.fetchone()[0]
+                            st.info(f"📈 **Total Trades Recorded:** {total_trades:,}")
+                            
+                            # Count today's trades  
+                            today = datetime.now().strftime("%Y-%m-%d")
+                            result = conn.execute(text("SELECT COUNT(*) FROM trades WHERE DATE(timestamp) = ?"), (today,))
+                            today_trades = result.fetchone()[0]
+                            st.info(f"🗓️ **Today's Trades:** {today_trades}")
+                            
+                    else:
+                        st.warning("⚠️ Database file not found - will be created on first trade")
+                        
+                except Exception as e:
+                    st.error(f"❌ Database Error: {str(e)}")
+                    st.error("This may cause trade recording failures. Check logs for details.")
             
-            # Automated Trading Controls
+            st.markdown("---")
             col_toggle, col_capital = st.columns(2)
             with col_toggle:
                 auto_enabled = st.checkbox(
@@ -1516,6 +1639,40 @@ def live_trading_section():
             
             st.markdown("---")
         
+        # Database Health Check (available for all user types)
+        if not is_institution:  # Show for retail users too
+            with st.expander("🔧 Database Diagnostics", expanded=False):
+                db_healthy, db_message = check_db_health()
+                if db_healthy:
+                    st.success(f"✅ {db_message}")
+                else:
+                    st.error(f"❌ {db_message}")
+                    st.error("⚠️ Database issues may prevent trade recording")
+                
+                # Show database details
+                st.info(f"📁 **Database Location:** `{DB_FILE.absolute()}`")
+                
+                try:
+                    if DB_FILE.exists():
+                        size_bytes = DB_FILE.stat().st_size
+                        size_mb = size_bytes / (1024 * 1024)
+                        st.success(f"📊 **Database Size:** {size_mb:.2f} MB")
+                        
+                        # Test database connection and show trade counts
+                        engine = get_db_engine()
+                        with engine.connect() as conn:
+                            # Count user's trades
+                            result = conn.execute(text("SELECT COUNT(*) FROM trades WHERE user_id = ?"), (st.session_state.user_id,))
+                            user_trades = result.fetchone()[0]
+                            st.info(f"📈 **Your Total Trades:** {user_trades:,}")
+                            
+                    else:
+                        st.warning("⚠️ Database file not found - will be created on first trade")
+                        
+                except Exception as e:
+                    st.error(f"❌ Database Error: {str(e)}")
+                    st.error("This may cause trade recording failures. Check logs for details.")
+        
         # Manual Trading form
         trading_mode = "🤖 AUTO" if (is_institution and auto_manager.is_active) else "👤 MANUAL"
         
@@ -1549,14 +1706,25 @@ def live_trading_section():
             
             # Show validation info before trade
             if trade_side == "BUY":
-                required_margin = current_rate * quantity if current_rate else 0
-                st.caption(f"💸 Required margin: ${required_margin:,.2f}")
+                required_margin = current_rate * quantity * 0.01 if current_rate else 0  # 1% margin
+                st.caption(f"💸 Required margin (1% leverage): ${required_margin:,.2f}")
                 if required_margin > available_balance:
-                    st.error(f"⚠️ Insufficient balance! Need ${required_margin:,.2f}, have ${available_balance:,.2f}")
+                    st.error(f"⚠️ Insufficient margin! Need ${required_margin:,.2f}, have ${available_balance:,.2f}")
             elif trade_side == "SELL":
-                st.caption(f"📊 Current position: {net_position:,.0f} units")
-                if quantity > net_position:
-                    st.error(f"⚠️ Insufficient position! Trying to sell {quantity}, but only have {net_position} units")
+                required_margin = current_rate * quantity * 0.01 if current_rate else 0  # 1% margin
+                new_position = net_position - quantity
+                position_type = "🟢 LONG" if net_position > 0 else "🔴 SHORT" if net_position < 0 else "⚪ FLAT"
+                
+                st.caption(f"📊 Current position: {net_position:,.0f} units ({position_type})")
+                st.caption(f"📉 After trade: {new_position:,.0f} units")
+                st.caption(f"💸 Required margin: ${required_margin:,.2f}")
+                
+                # Show warning for large short positions
+                if new_position < -50000:
+                    st.warning(f"⚠️ Large short position: {new_position:,.0f} units")
+                    
+                if required_margin > available_balance:
+                    st.error(f"⚠️ Insufficient margin! Need ${required_margin:,.2f}, have ${available_balance:,.2f}")
             
             strategy = st.selectbox("Strategy", ["Manual", "SMA", "RSI", "Bollinger"])
             
@@ -2103,6 +2271,28 @@ def main():
     """Main application entry point"""
     # Initialize database
     init_db()
+    
+    # Check database health and display status in sidebar
+    with st.sidebar:
+        with st.expander("System Status", expanded=False):
+            db_healthy, db_message = check_db_health()
+            if db_healthy:
+                st.success(f"✅ Database: {db_message}")
+            else:
+                st.error(f"❌ Database: {db_message}")
+            
+            st.info(f"📁 Database Location: {DB_FILE.absolute()}")
+            
+            # Show database file size if it exists
+            try:
+                if DB_FILE.exists():
+                    size_bytes = DB_FILE.stat().st_size
+                    size_mb = size_bytes / (1024 * 1024)
+                    st.info(f"📊 Database Size: {size_mb:.2f} MB")
+                else:
+                    st.warning("⚠️ Database file not found")
+            except Exception as e:
+                st.warning(f"⚠️ Cannot read database file: {e}")
     
     # Initialize session state
     if 'logged_in' not in st.session_state:
