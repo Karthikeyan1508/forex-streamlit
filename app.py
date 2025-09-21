@@ -466,7 +466,7 @@ class AutomatedTradingManager:
         for pair in self.monitored_pairs:
             if pair not in currency_rates:
                 continue
-                
+            
             # Add current rate to streaming data
             current_rate = currency_rates[pair]
             # Add some volatility for realistic simulation
@@ -978,6 +978,158 @@ def insert_trade(user_id, symbol, side, price, quantity, strategy):
         st.write(f"DEBUG: Failed to insert trade for user_id: {user_id}")
         return False, "Error"
 
+def get_user_position(user_id, symbol):
+    """Get current position for a user in a specific symbol"""
+    engine = get_db_engine()
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT side, SUM(quantity) as total_quantity 
+                FROM trades 
+                WHERE user_id = :user_id AND symbol = :symbol AND status = 'Filled'
+                GROUP BY side
+            """), {"user_id": user_id, "symbol": symbol})
+            
+            positions = result.fetchall()
+            buy_quantity = 0
+            sell_quantity = 0
+            
+            for row in positions:
+                if row[0] == 'BUY':
+                    buy_quantity = row[1]
+                elif row[0] == 'SELL':
+                    sell_quantity = row[1]
+            
+            # Net position = buys - sells
+            net_position = buy_quantity - sell_quantity
+            return net_position, buy_quantity, sell_quantity
+    except Exception as e:
+        st.error(f"Error getting position: {e}")
+        return 0, 0, 0
+
+def get_user_balance(user_id):
+    """Calculate user's available balance based on trades"""
+    engine = get_db_engine()
+    try:
+        with engine.connect() as conn:
+            # Get all filled trades to calculate P&L
+            result = conn.execute(text("""
+                SELECT symbol, side, price, quantity, timestamp
+                FROM trades 
+                WHERE user_id = :user_id AND status = 'Filled'
+                ORDER BY timestamp
+            """), {"user_id": user_id})
+            
+            trades = result.fetchall()
+            
+            # Start with initial balance
+            initial_balance = 10000  # Default starting balance
+            
+            # Calculate realized P&L from closed positions
+            positions = {}  # symbol -> list of open positions
+            realized_pnl = 0
+            
+            for trade in trades:
+                symbol, side, price, quantity, timestamp = trade
+                
+                if symbol not in positions:
+                    positions[symbol] = []
+                
+                if side == 'BUY':
+                    positions[symbol].append({'price': price, 'quantity': quantity})
+                elif side == 'SELL' and positions[symbol]:
+                    # Close positions FIFO
+                    remaining_sell = quantity
+                    while remaining_sell > 0 and positions[symbol]:
+                        open_pos = positions[symbol][0]
+                        close_qty = min(remaining_sell, open_pos['quantity'])
+                        
+                        # Calculate P&L
+                        pnl = (price - open_pos['price']) * close_qty
+                        realized_pnl += pnl
+                        
+                        # Update positions
+                        open_pos['quantity'] -= close_qty
+                        remaining_sell -= close_qty
+                        
+                        if open_pos['quantity'] == 0:
+                            positions[symbol].pop(0)
+            
+            # Calculate margin used by open positions
+            margin_used = 0
+            for symbol, open_positions in positions.items():
+                for pos in open_positions:
+                    margin_used += pos['price'] * pos['quantity']
+            
+            available_balance = initial_balance + realized_pnl - margin_used
+            return max(0, available_balance), realized_pnl, margin_used
+            
+    except Exception as e:
+        st.error(f"Error calculating balance: {e}")
+        return 10000, 0, 0
+
+def validate_trade(user_id, symbol, side, price, quantity):
+    """Validate if a trade can be executed"""
+    
+    # Get current position and balance
+    net_position, buy_qty, sell_qty = get_user_position(user_id, symbol)
+    available_balance, realized_pnl, margin_used = get_user_balance(user_id)
+    
+    if side == 'BUY':
+        # Check if user has enough balance
+        required_margin = price * quantity
+        if required_margin > available_balance:
+            return False, f"Insufficient balance. Required: ${required_margin:.2f}, Available: ${available_balance:.2f}"
+            
+    elif side == 'SELL':
+        # Check if user has enough position to sell
+        if quantity > net_position:
+            return False, f"Insufficient position. Trying to sell {quantity}, but only have {net_position} units"
+    
+    return True, "Trade validated"
+
+def insert_trade(user_id, symbol, side, price, quantity, strategy):
+    """Insert a trade into database with validation"""
+    
+    # Validate trade first
+    is_valid, message = validate_trade(user_id, symbol, side, price, quantity)
+    if not is_valid:
+        return False, f"REJECTED: {message}"
+    
+    engine = get_db_engine()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Simulate realistic order processing
+    import random
+    
+    # 95% success rate for market orders (after validation)
+    if random.random() < 0.95:
+        status = "Filled"
+    else:
+        status = random.choice(["Rejected", "Cancelled"])
+    
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+            INSERT INTO trades (user_id, timestamp, symbol, side, price, quantity, status, strategy)
+            VALUES (:user_id, :timestamp, :symbol, :side, :price, :quantity, :status, :strategy)
+            """), {
+                "user_id": user_id,
+                "timestamp": timestamp,
+                "symbol": symbol,
+                "side": side,
+                "price": price,
+                "quantity": quantity,
+                "status": status,
+                "strategy": strategy
+            })
+            conn.commit()
+            
+            return True, status
+    except Exception as e:
+        st.error(f"Error inserting trade: {e}")
+        return False, "Error"
+
 def load_trades(user_id):
     """Load trades for a specific user"""
     engine = get_db_engine()
@@ -1366,6 +1518,24 @@ def live_trading_section():
         
         # Manual Trading form
         trading_mode = "🤖 AUTO" if (is_institution and auto_manager.is_active) else "👤 MANUAL"
+        
+        # Show current position and balance
+        st.markdown("**💰 Account Status**")
+        net_position, buy_qty, sell_qty = get_user_position(st.session_state.user_id, symbol)
+        available_balance, realized_pnl, margin_used = get_user_balance(st.session_state.user_id)
+        
+        col_pos1, col_pos2, col_pos3 = st.columns(3)
+        with col_pos1:
+            st.metric("Available Balance", f"${available_balance:,.2f}")
+        with col_pos2:
+            position_color = "🟢" if net_position > 0 else "🔴" if net_position < 0 else "⚪"
+            st.metric(f"{position_color} Net Position", f"{net_position:,.0f} units")
+        with col_pos3:
+            pnl_color = "🟢" if realized_pnl > 0 else "🔴" if realized_pnl < 0 else "⚪"
+            st.metric(f"{pnl_color} Realized P&L", f"${realized_pnl:,.2f}")
+        
+        st.markdown("---")
+        
         with st.form("trade_form", clear_on_submit=False):
             st.markdown(f"**⚡ Execute Trade ({trading_mode})**")
             trade_side = st.selectbox("Trade Type", ["BUY", "SELL"])
@@ -1376,6 +1546,18 @@ def live_trading_section():
                 quantity = st.number_input("Quantity", min_value=100, value=suggested_size, step=100)
             else:
                 quantity = st.number_input("Quantity", min_value=100, value=1000, step=100)
+            
+            # Show validation info before trade
+            if trade_side == "BUY":
+                required_margin = current_rate * quantity if current_rate else 0
+                st.caption(f"💸 Required margin: ${required_margin:,.2f}")
+                if required_margin > available_balance:
+                    st.error(f"⚠️ Insufficient balance! Need ${required_margin:,.2f}, have ${available_balance:,.2f}")
+            elif trade_side == "SELL":
+                st.caption(f"📊 Current position: {net_position:,.0f} units")
+                if quantity > net_position:
+                    st.error(f"⚠️ Insufficient position! Trying to sell {quantity}, but only have {net_position} units")
+            
             strategy = st.selectbox("Strategy", ["Manual", "SMA", "RSI", "Bollinger"])
             
             if st.form_submit_button("Execute Trade", type="primary"):
@@ -1391,8 +1573,9 @@ def live_trading_section():
                     if order_status == "Filled":
                         st.success(f"🟢 Order {order_status}: {trade_side} {quantity} {symbol} @ {current_rate:.5f}")
                         st.balloons()
-                    elif order_status == "Rejected":
-                        st.error(f"🔴 Order {order_status}: {trade_side} {quantity} {symbol} - Insufficient liquidity")
+                        st.rerun()  # Refresh to update positions
+                    elif "REJECTED" in order_status:
+                        st.error(f"🔴 {order_status}")
                     elif order_status == "Cancelled":
                         st.warning(f"🟡 Order {order_status}: {trade_side} {quantity} {symbol} - Market closed")
                 else:
@@ -1494,7 +1677,49 @@ def live_trading_section():
     
     # Live Order Status Monitor
     st.markdown("---")
-    st.markdown("#### Live Order Status Monitor - Multi-Currency Trading History")
+    st.markdown("#### 💼 Account Overview & Trading History")
+    
+    # Account Summary
+    st.markdown("**📊 Account Summary**")
+    available_balance, realized_pnl, margin_used = get_user_balance(st.session_state.user_id)
+    
+    col_bal1, col_bal2, col_bal3, col_bal4 = st.columns(4)
+    with col_bal1:
+        st.metric("💰 Available Balance", f"${available_balance:,.2f}")
+    with col_bal2:
+        pnl_color = "🟢" if realized_pnl >= 0 else "🔴"
+        st.metric(f"{pnl_color} Total P&L", f"${realized_pnl:,.2f}")
+    with col_bal3:
+        st.metric("📊 Margin Used", f"${margin_used:,.2f}")
+    with col_bal4:
+        equity = available_balance + margin_used
+        st.metric("💎 Total Equity", f"${equity:,.2f}")
+    
+    # Position Summary by Currency Pair
+    st.markdown("**🎯 Current Positions**")
+    positions_data = []
+    
+    # Check positions for all major currency pairs
+    major_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD", "NZD/USD"]
+    for pair in major_pairs:
+        net_pos, buy_qty, sell_qty = get_user_position(st.session_state.user_id, pair)
+        if net_pos != 0:  # Only show pairs with positions
+            positions_data.append({
+                "Currency Pair": pair,
+                "Net Position": f"{net_pos:,.0f}",
+                "Total Buys": f"{buy_qty:,.0f}",
+                "Total Sells": f"{sell_qty:,.0f}",
+                "Status": "🟢 LONG" if net_pos > 0 else "🔴 SHORT"
+            })
+    
+    if positions_data:
+        positions_df = pd.DataFrame(positions_data)
+        st.dataframe(positions_df, hide_index=True, use_container_width=True)
+    else:
+        st.info("📭 No open positions")
+    
+    st.markdown("---")
+    st.markdown("#### 📋 Live Order Status Monitor")
     
     # Enhanced filtering for institutional users
     if is_institution:
